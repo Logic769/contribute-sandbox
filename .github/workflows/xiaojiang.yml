@@ -31,8 +31,15 @@ env:
 
 jobs:
   answer:
+    # 三种召唤方式：/小酱 前缀、@XiaoJiang-code、@小酱。
+    # 排除小酱自己和 github-actions[bot]，否则回帖里带「小酱」就会自我触发成死循环。
     if: |
-      startsWith(github.event.comment.body, '/小酱 ') &&
+      (
+        startsWith(github.event.comment.body, '/小酱 ') ||
+        contains(github.event.comment.body, '@XiaoJiang-code') ||
+        contains(github.event.comment.body, '@小酱')
+      ) &&
+      !contains(fromJSON('["XiaoJiang-code","github-actions[bot]"]'), github.event.comment.user.login) &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 45
