@@ -1,17 +1,19 @@
-name: xiaojiang
+name: xiaojiang-fork
 
-# 只读模式：小酱在你的仓库里读代码、回答问题、给建议，不写任何文件、不开 PR。
-# 安装：把三个文件放进目标仓库——
-#   .github/workflows/xiaojiang.yml  （本文件）
-#   .xiaojiang/persona.md           （人设，从调度仓库 prompts/persona.md 复制）
-#   .xiaojiang/key-proxy.mjs        （本地 key 代理，从调度仓库 scripts/key-proxy.mjs 复制）
-# 再配一个 DSH_API_KEY secret。用 readonly/install.ps1 可以一次做完这些。
+# fork 模式：你在自己的仓库里召唤小酱，它把这个仓库 fork 到自己账号，在 fork 上分析。
+# 你的仓库始终只读 —— 代码、记忆、会话全部落在 fork 里，和你的账号脱节。
+#
+# 需要两个 secret：
+#   DSH_API_KEY     模型网关的 key（sk- 开头）
+#   XIAOJIANG_PAT   小酱账号的 classic PAT（repo scope），fork + 写 fork 都用它
+#
+# 安装：把 xiaojiang.yml / persona.md / key-proxy.mjs 推进目标仓库，见 readonly/install.ps1。
 
 on:
   issue_comment:
     types: [created]
 
-# 注意：没有 contents: write —— 这个 workflow 不往仓库里写任何东西。
+# 只回帖要写权限；仓库内容一个字都不改，所以 contents 只要能读。
 permissions:
   contents: read
   issues: write
@@ -21,29 +23,94 @@ concurrency:
   group: xiaojiang-${{ github.event.issue.number }}
   cancel-in-progress: false
 
+env:
+  DSH_MODEL: ${{ vars.DSH_MODEL || 'group/never-stuck' }}
+  # 记忆放在小酱名下的 private 仓库里，不跟着 public 的 fork 一起公开。
+  MEM_REPO: ${{ vars.COOWER_MEM_REPO || 'XiaoJiang-code/xiaojiang-memory' }}
+  KEY_PROXY_UPSTREAM: ${{ vars.DSH_BASE_URL || 'https://logic769.xyz/v1' }}
+
 jobs:
   answer:
-    # 四道门：斜杠开头、作者可信、带 repo= 的不归这里管（那是调度仓库的活）。
     if: |
       startsWith(github.event.comment.body, '/小酱 ') &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
-      !contains(github.event.comment.body, 'repo=')
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      DSH_MODEL: ${{ vars.DSH_MODEL || 'group/never-stuck' }}
-      KEY_PROXY_UPSTREAM: ${{ vars.DSH_BASE_URL || 'https://logic769.xyz/v1' }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Fork or reuse
+        id: fork
+        env:
+          BOT_PAT: ${{ secrets.XIAOJIANG_PAT }}
+          SRC: ${{ github.repository }}
+        run: |
+          if [ -z "$BOT_PAT" ]; then
+            echo "::error::缺 secret XIAOJIANG_PAT（小酱账号的 classic PAT，scope 至少 repo）"
+            exit 1
+          fi
+          export GH_TOKEN="$BOT_PAT"
+          BOT=$(gh api user --jq .login)
+          NAME=${SRC#*/}
+          echo "bot=$BOT src=$SRC name=$NAME"
+          # 已经 fork 过就直接复用；fork 是异步的，新建要多等几秒。
+          FLAG=$(gh api "repos/$BOT/$NAME" --jq ".fork" 2>/dev/null || echo none)
+          echo "fork_before=$FLAG"
+          if [ "$FLAG" != "true" ]; then
+            gh api -X POST "repos/$SRC/forks" --jq ".full_name" || true
+            for i in $(seq 1 20); do
+              FLAG=$(gh api "repos/$BOT/$NAME" --jq ".fork" 2>/dev/null || echo none)
+              if [ "$FLAG" = "true" ]; then break; fi
+              sleep 3
+            done
+          fi
+          if [ "$FLAG" != "true" ]; then
+            echo "::error::fork 失败：$BOT/$NAME 不可用（私有仓库？同名仓库？PAT 权限不足？）"
+            exit 1
+          fi
+          echo "bot_repo=$BOT/$NAME" >> "$GITHUB_OUTPUT"
+          gh repo clone "$BOT/$NAME" fork -- --depth 50
+          cd fork
+          git config user.name "xiaojiang"
+          git config user.email "{{EMAIL_9am2kw4p}}"
+          echo "cloned=$BOT/$NAME head=$(git rev-parse --short HEAD)"
+
+      - name: Prepare memory repo
+        env:
+          GH_TOKEN: ${{ secrets.XIAOJIANG_PAT }}
+        run: |
+          if ! gh repo view "$MEM_REPO" > /dev/null 2>&1; then
+            echo "memory_repo_missing - 正在建 $MEM_REPO"
+            gh repo create "$MEM_REPO" --private --description '小酱的跨对话记忆（交接 + 会话包）' > /dev/null || true
+            for i in $(seq 1 10); do
+              if gh repo view "$MEM_REPO" > /dev/null 2>&1; then break; fi
+              sleep 3
+            done
+          fi
+          if gh repo view "$MEM_REPO" --json isEmpty --jq '.isEmpty' 2>/dev/null | grep -q true; then
+            mkdir -p memory-repo
+            cd memory-repo
+            git init -b main > /dev/null
+            gh auth setup-git
+            git remote add origin "https://github.com/$MEM_REPO.git"
+            git config user.name "xiaojiang"
+            git config user.email "{{EMAIL_9am2kw4p}}"
+            printf '# 小酱的记忆\n' > README.md
+            git add README.md
+            git commit -m 'init' > /dev/null
+            git push -u origin main
+            echo "memory_repo=created"
+          else
+            gh repo clone "$MEM_REPO" memory-repo -- --depth 50
+            cd memory-repo
+            git config user.name "xiaojiang"
+            git config user.email "{{EMAIL_9am2kw4p}}"
+            echo "memory_repo=reused"
+          fi
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Install dsh
-        # dsh plugin 把安装转发给 pnpm，而 runner 只自带 npm —— 缺了就是 exit 127。
         run: |
           npm i -g pnpm
           npm i -g @deepseek-ai/dsh@0.2.1-rc.5
@@ -61,16 +128,35 @@ jobs:
           '
           dsh --profile coworker --dump-config > /dev/null
 
+      - name: Restore session
+        id: sess
+        run: |
+          mkdir -p "$HOME/.dsh/sessions"
+          cd memory-repo
+          SLUG=$(printf '%s' "$GITHUB_REPOSITORY" | tr '/' '-')
+          if git fetch --no-tags --depth 1 origin "session-$SLUG" 2>/dev/null; then
+            if git show FETCH_HEAD:sessions.tar.zst > /tmp/sessions.tar.zst 2>/dev/null; then
+              echo "session_pack_bytes=$(wc -c < /tmp/sessions.tar.zst)"
+              if tar --zstd -xf /tmp/sessions.tar.zst -C "$HOME"; then echo "session_restored=yes"; fi
+            else
+              echo "session_restored=none - 记忆仓库里还没有这个仓库的会话包"
+            fi
+          else
+            echo "session_restored=none - session-$SLUG 分支还不存在"
+          fi
+
       - name: Build task
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE: ${{ github.event.issue.number }}
         run: |
           mkdir -p .ci
+          SLUG=$(printf '%s' "$GITHUB_REPOSITORY" | tr '/' '-')
+          MEM_DIR="memory-repo/memory/$SLUG"
+          mkdir -p "$MEM_DIR/issues"
           IS_PR=$(jq -r 'if .issue.pull_request then "1" else "0" end' "$GITHUB_EVENT_PATH")
-          THREAD=.ci/thread.md
+          THREAD=".ci/thread.md"
           if [ "$IS_PR" = "1" ]; then
-            # 一次 --json 取齐：默认查询会拉 statusCheckRollup，GITHUB_TOKEN 没有 checks 读权限。
             gh pr view "$ISSUE" --json title,body,headRefName,baseRefName,isCrossRepository,comments > .ci/pr.json
             {
               printf '# PR #%s %s\n\n%s\n\n---\n\n' "$ISSUE" "$(jq -r .title .ci/pr.json)" "$(jq -r '.body // ""' .ci/pr.json)"
@@ -81,7 +167,16 @@ jobs:
             gh issue view "$ISSUE" --comments > "$THREAD"
           fi
           echo "thread_file=$THREAD bytes=$(wc -c < "$THREAD")"
-          # 会话不续接：只读模式每轮独立，上下文靠 issue 历史和仓库代码本身。
+          # 会话能续接时前面的历史已经在会话里，不必再塞 60 KB 交接。
+          RESUMING=0
+          SID_FILE="$MEM_DIR/issues/.session-$ISSUE"
+          if [ -f "$SID_FILE" ]; then
+            OLD="$(cat "$SID_FILE")"
+            if [ -n "$OLD" ] && find "$HOME/.dsh/sessions" -maxdepth 3 -type d \( -name "$OLD" -o -name "session-$OLD" \) 2>/dev/null | head -1 | grep -q .; then
+              RESUMING=1
+            fi
+          fi
+          echo "resuming=$RESUMING"
           {
             if [ -f .xiaojiang/persona.md ]; then
               cat .xiaojiang/persona.md
@@ -89,25 +184,37 @@ jobs:
               echo "---"
               echo
             else
-              echo "::warning::.xiaojiang/persona.md 缺失，本轮没有加载基础提示词"
+              echo "::warning::.xiaojiang/persona.md 缺失"
             fi
-            echo "## 本轮是只读模式（覆盖上面的环境说明）"
+            echo "## 本轮的工作方式：fork 模式（覆盖上面的环境说明）"
             echo
-            echo "你在 $GITHUB_REPOSITORY 里，这个仓库就是你要读、要分析的仓库，就在当前目录。"
-            echo "没有 target/ 子目录，也没有 memory/ 交接文档。"
+            echo "你在小酱账号名下的 fork 里，目录是 $GITHUB_WORKSPACE/fork。"
+            echo "这一份是从 ${{ github.repository }} fork 出来的，代码内容和原仓一样。"
+            echo "原仓库对你只读：你改不进去，也不需要改进去。"
             echo
-            echo "**你不能写任何文件、不能 commit、不能开 PR。** 这一轮没有推送步骤，"
-            echo "你在磁盘上改的任何东西都会随容器一起消失。所以你唯一的产出是最终回复里的文字。"
-            echo
-            echo "要改代码时：把改动写成 patch 或完整文件片段放进回复，让人自己贴。"
-            echo "要给结论时：直接给结论和依据，不要复述你读了哪些文件。"
+            echo "**记忆和会话都存在这个 fork 里**（memory/ 目录 + coworker-session 分支），"
+            echo "下一轮还在这个 issue 里叫你会接着上一次的会话。"
             echo
             if [ "$IS_PR" = "1" ]; then
-              echo "调度入口：$GITHUB_REPOSITORY 的 PR #$ISSUE（$(jq -r .headRefName .ci/pr.json) → $(jq -r .baseRefName .ci/pr.json)）"
+              echo "调度入口：$GITHUB_REPOSITORY 的 PR #$ISSUE"
             else
               echo "调度入口：$GITHUB_REPOSITORY 的 issue #$ISSUE"
             fi
             echo
+            if [ -f "$MEM_DIR/HANDOFF.md" ]; then
+              if [ "$RESUMING" = "1" ]; then
+                echo "## 交接文档"
+                echo
+                echo "这一轮续接的是同一个会话，前面的事都在你的上下文里。"
+                echo "完整交接在 $MEM_DIR/HANDOFF.md，需要核对细节时自己读。"
+                echo
+              else
+                echo "## 本仓库的交接（上一轮留下的，由 billion-context 导出）"
+                echo
+                cat "$MEM_DIR/HANDOFF.md"
+                echo
+              fi
+            fi
             echo "## 讨论上下文（按需自取，不必整段引用）"
             echo
             echo "全文在：$GITHUB_WORKSPACE/$THREAD"
@@ -120,9 +227,10 @@ jobs:
             gh issue view "$ISSUE" --json comments --jq '.comments[-1].body'
             echo
             echo "## 本次任务要求"
-            echo "1. 只读：不要写文件、不要 commit、不要 push、不要开 PR。"
-            echo "2. 回复里不要出现密钥、令牌或任何凭据。"
-            echo "3. 直接给结论和下一步，不要复述过程。"
+            echo "1. 你的改动只会留在 fork 里，不会进原仓库 —— 要让人看见结论，就写进最终回复。"
+            echo "2. 交接文档不用手写，也绝对不要写进回复；完整会话会自动导出到小酱自己的记忆仓库。"
+            echo "3. 回复里不要出现密钥、令牌或任何凭据。"
+            echo "4. 直接给结论和下一步，不要复述过程。"
           } > .ci/task.txt
           echo "task_bytes=$(wc -c < .ci/task.txt)"
 
@@ -130,7 +238,6 @@ jobs:
         env:
           REAL_KEY: ${{ secrets.DSH_API_KEY }}
         run: |
-          # 真 key 只作为 stdin 喂给代理进程，dsh 全程只看到假值。
           printf '%s' "$REAL_KEY" | nohup node .xiaojiang/key-proxy.mjs > .ci/proxy.log 2>&1 &
           PROXY_PID=$!
           echo "$PROXY_PID" > .ci/proxy.pid
@@ -148,14 +255,29 @@ jobs:
       - name: Ask
         env:
           DSH_API_KEY: sk-local-proxy-not-a-real-key
+          ISSUE: ${{ github.event.issue.number }}
         run: |
           export DEEPSEEK_API_KEY="$DSH_API_KEY"
           export DSH_API_KEY="$DSH_API_KEY"
           export DEEPSEEK_BASE_URL="http://127.0.0.1:8787/v1"
           printf -- '- id: agent-default-model\n  config:\n    provider: deepseek-official\n    model: %s\n' "$DSH_MODEL" > .ci/model.patch.yml
+          SID_FILE="fork/memory/issues/.session-$ISSUE"
+          ARGS=()
+          if [ -f "$SID_FILE" ]; then
+            OLD_SID="$(cat "$SID_FILE")"
+            FOUND=$(find "$HOME/.dsh/sessions" -maxdepth 3 -type d \( -name "$OLD_SID" -o -name "session-$OLD_SID" \) 2>/dev/null | head -1)
+            if [ -n "$OLD_SID" ] && [ -n "$FOUND" ]; then
+              ARGS+=(--session-id "$OLD_SID")
+              echo "resume_session=$OLD_SID"
+            else
+              echo "resume_session=miss(${OLD_SID:-none})"
+            fi
+          else
+            echo "resume_session=none - 这个 thread 还没有过会话"
+          fi
           set +e
-          # 必须走 stdin 管道：帮助文档说的 "-" 实际会报 a task is required。
-          cat .ci/task.txt | dsh --profile coworker --patch .ci/model.patch.yml --json > .ci/run.jsonl 2> .ci/run.err
+          # 以 fork 为工作目录跑：能读代码，也能就地写记忆。
+          ( cd fork && cat "$GITHUB_WORKSPACE/.ci/task.txt" | dsh --profile coworker --patch "$GITHUB_WORKSPACE/.ci/model.patch.yml" --json "${ARGS[@]}" ) > .ci/run.jsonl 2> .ci/run.err
           code=$?
           set -e
           echo "$code" > .ci/exit
@@ -171,23 +293,73 @@ jobs:
         if: always()
         run: |
           echo "proxy_stats=$(curl -fsS http://127.0.0.1:8787/healthz 2>/dev/null || echo '{}')"
-          if [ -f .ci/proxy.pid ]; then
-            kill "$(cat .ci/proxy.pid)" 2>/dev/null || true
-          fi
+          if [ -f .ci/proxy.pid ]; then kill "$(cat .ci/proxy.pid)" 2>/dev/null || true; fi
           pkill -f 'key-proxy[.]mjs' 2>/dev/null || true
           echo "proxy_stopped"
+
+      - name: Export handoff
+        run: |
+          SLUG=$(printf '%s' "$GITHUB_REPOSITORY" | tr '/' '-')
+          MEM="memory-repo/memory/$SLUG/HANDOFF.md"
+          mkdir -p "$(dirname "$MEM")"
+          SID=$(jq -R -r 'fromjson? | select(.type=="session") | .sessionId' .ci/run.jsonl | head -1)
+          echo "session_id=${SID:-none}"
+          BILI="$HOME/.dsh/profiles/coworker/node_modules/billion-context/dist/index.js"
+          if [ -z "$SID" ] || [ ! -f "$BILI" ]; then
+            echo "::warning::拿不到 session id 或 billion-context 没装，交接改走回复兜底"
+          else
+            if node "$BILI" export "$SID" --output "$MEM" > .ci/bili.log 2>&1 && [ -s "$MEM" ] && [ "$(wc -c < "$MEM")" -ge 500 ]; then
+              echo "handoff_source=bili-summary bytes=$(wc -c < "$MEM")"
+            elif node "$BILI" export "$SID" --full --output "$MEM" > .ci/bili.log 2>&1 && [ -s "$MEM" ]; then
+              head -c 120000 "$MEM" > "$MEM.cut" && mv "$MEM.cut" "$MEM"
+              echo "handoff_source=bili-full bytes=$(wc -c < "$MEM")"
+            else
+              echo "::warning::bili export 失败"
+              tail -20 .ci/bili.log || echo "(no log)"
+            fi
+          fi
+          if [ -f "$MEM" ] && [ "$(wc -c < "$MEM")" -gt 60000 ]; then
+            { head -c 2000 "$MEM"; printf '\n\n…（中间省略：导出超 60 KB，只留头尾）…\n\n'; tail -c 58000 "$MEM"; } > "$MEM.cut"
+            mv "$MEM.cut" "$MEM"
+            echo "handoff_truncated bytes=$(wc -c < "$MEM")"
+          fi
+          if [ ! -s "$MEM" ]; then
+            {
+              echo "# 交接 · issue #${{ github.event.issue.number }} · $(date -u +%F)"
+              echo
+              cat .ci/reply.md 2>/dev/null || echo "(无回复)"
+            } > "$MEM"
+            echo "handoff_source=reply-fallback bytes=$(wc -c < "$MEM")"
+          fi
+          if [ -n "$SID" ]; then
+            mkdir -p "$(dirname "$MEM")"/issues
+            printf "%s\n" "$SID" > "$(dirname "$MEM")/issues/.session-${{ github.event.issue.number }}"
+            echo "session_saved=$SID"
+          fi
+
+      - name: Persist memory
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          cd memory-repo
+          git add memory || true
+          if git diff --cached --quiet; then echo "memory unchanged"; exit 0; fi
+          git commit -m "memory: handoff from #$ISSUE"
+          git push origin HEAD || echo "::warning::memory push rejected - 下一轮看不到这次交接"
+          echo "memory_pushed=$(git rev-parse --short HEAD)"
 
       - name: Redact
         if: always()
         env:
           SECRET_A: ${{ secrets.DSH_API_KEY }}
+          SECRET_B: ${{ secrets.XIAOJIANG_PAT }}
         run: |
           node <<'NODE'
           const fs = require('fs');
           const p = '.ci/reply.md';
           if (!fs.existsSync(p)) { console.log('redact=skip'); process.exit(0); }
           let s = fs.readFileSync(p, 'utf8');
-          const known = [process.env.SECRET_A].filter(v => typeof v === 'string' && v.length >= 8);
+          const known = [process.env.SECRET_A, process.env.SECRET_B].filter(v => typeof v === 'string' && v.length >= 8);
           let hits = 0;
           for (const v of known) {
             const re = new RegExp(v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
@@ -228,9 +400,27 @@ jobs:
               echo '```'
             } > .ci/body.md
           fi
-          # Reply 是另一步 shell，IS_PR 不会带过来 —— 现算一次。
           if [ "$(jq -r 'if .issue.pull_request then "1" else "0" end' "$GITHUB_EVENT_PATH")" = "1" ]; then
             gh pr comment "$ISSUE" --body-file .ci/body.md
           else
             gh issue comment "$ISSUE" --body-file .ci/body.md
           fi
+
+      - name: Save session
+        if: always()
+        run: |
+          SESS="$HOME/.dsh/sessions"
+          if [ ! -d "$SESS" ]; then echo "session_save=skip(no sessions dir)"; exit 0; fi
+          if ! tar --zstd -cf /tmp/sessions.tar.zst -C "$HOME" .dsh/sessions 2>/dev/null; then
+            echo "::warning::会话打包失败，跳过保存"; exit 0
+          fi
+          SIZE=$(wc -c < /tmp/sessions.tar.zst)
+          echo "session_pack_bytes=$SIZE"
+          if [ "$SIZE" -gt 52428800 ]; then echo "::warning::会话包 $SIZE 字节超过 50 MB，跳过保存"; exit 0; fi
+          cd memory-repo
+          SLUG=$(printf '%s' "$GITHUB_REPOSITORY" | tr '/' '-')
+          BLOB=$(git hash-object -w /tmp/sessions.tar.zst)
+          TREE=$(printf '100644 blob %s\tsessions.tar.zst\n' "$BLOB" | git mktree)
+          COMMIT=$(git -c user.name=xiaojiang -c user.email={{EMAIL_9am2kw4p}} commit-tree "$TREE" -m "session: issue #${{ github.event.issue.number }} run ${{ github.run_id }}")
+          git push -f origin "$COMMIT:refs/heads/session-$SLUG" 2>&1 | tail -2
+          echo "session_pushed=$COMMIT"
