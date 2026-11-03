@@ -37,6 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      # gh 命令要从 git remote 推断仓库，先把调用方仓库签出来（只为给 gh 一个上下文）。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Fork or reuse
         id: fork
         env:
