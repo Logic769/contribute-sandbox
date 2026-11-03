@@ -1,0 +1,236 @@
+name: xiaojiang
+
+# 只读模式：小酱在你的仓库里读代码、回答问题、给建议，不写任何文件、不开 PR。
+# 安装：把三个文件放进目标仓库——
+#   .github/workflows/xiaojiang.yml  （本文件）
+#   .xiaojiang/persona.md           （人设，从调度仓库 prompts/persona.md 复制）
+#   .xiaojiang/key-proxy.mjs        （本地 key 代理，从调度仓库 scripts/key-proxy.mjs 复制）
+# 再配一个 DSH_API_KEY secret。用 readonly/install.ps1 可以一次做完这些。
+
+on:
+  issue_comment:
+    types: [created]
+
+# 注意：没有 contents: write —— 这个 workflow 不往仓库里写任何东西。
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: xiaojiang-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  answer:
+    # 四道门：斜杠开头、作者可信、带 repo= 的不归这里管（那是调度仓库的活）。
+    if: |
+      startsWith(github.event.comment.body, '/小酱 ') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      !contains(github.event.comment.body, 'repo=')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DSH_MODEL: ${{ vars.DSH_MODEL || 'group/never-stuck' }}
+      KEY_PROXY_UPSTREAM: ${{ vars.DSH_BASE_URL || 'https://logic769.xyz/v1' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dsh
+        # dsh plugin 把安装转发给 pnpm，而 runner 只自带 npm —— 缺了就是 exit 127。
+        run: |
+          npm i -g pnpm
+          npm i -g @deepseek-ai/dsh@0.2.1-rc.5
+
+      - name: Install coworker profile
+        run: |
+          dsh plugin --profile coworker add billion-context dsh-read-url dsh-free-search dsh-mnemon
+          node -e '
+            const fs=require("fs"), os=require("os"), p=require("path");
+            const f=p.join(os.homedir(),".dsh/profiles/coworker/package.json");
+            const j=JSON.parse(fs.readFileSync(f,"utf8"));
+            const b=j.dsh.profile.bundles;
+            if(!b.includes("@deepseek-ai/dsh-headless")) b.splice(1,0,"@deepseek-ai/dsh-headless");
+            fs.writeFileSync(f,JSON.stringify(j,null,2));
+          '
+          dsh --profile coworker --dump-config > /dev/null
+
+      - name: Build task
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          mkdir -p .ci
+          IS_PR=$(jq -r 'if .issue.pull_request then "1" else "0" end' "$GITHUB_EVENT_PATH")
+          THREAD=.ci/thread.md
+          if [ "$IS_PR" = "1" ]; then
+            # 一次 --json 取齐：默认查询会拉 statusCheckRollup，GITHUB_TOKEN 没有 checks 读权限。
+            gh pr view "$ISSUE" --json title,body,headRefName,baseRefName,isCrossRepository,comments > .ci/pr.json
+            {
+              printf '# PR #%s %s\n\n%s\n\n---\n\n' "$ISSUE" "$(jq -r .title .ci/pr.json)" "$(jq -r '.body // ""' .ci/pr.json)"
+              jq -r '(.comments // []) | map("### " + .author.login + "\n\n" + .body) | join("\n\n")' .ci/pr.json
+            } > "$THREAD"
+            gh pr diff "$ISSUE" > .ci/pr.diff 2>/dev/null && echo "pr_diff_bytes=$(wc -c < .ci/pr.diff)"
+          else
+            gh issue view "$ISSUE" --comments > "$THREAD"
+          fi
+          echo "thread_file=$THREAD bytes=$(wc -c < "$THREAD")"
+          # 会话不续接：只读模式每轮独立，上下文靠 issue 历史和仓库代码本身。
+          {
+            if [ -f .xiaojiang/persona.md ]; then
+              cat .xiaojiang/persona.md
+              echo
+              echo "---"
+              echo
+            else
+              echo "::warning::.xiaojiang/persona.md 缺失，本轮没有加载基础提示词"
+            fi
+            echo "## 本轮是只读模式（覆盖上面的环境说明）"
+            echo
+            echo "你在 $GITHUB_REPOSITORY 里，这个仓库就是你要读、要分析的仓库，就在当前目录。"
+            echo "没有 target/ 子目录，也没有 memory/ 交接文档。"
+            echo
+            echo "**你不能写任何文件、不能 commit、不能开 PR。** 这一轮没有推送步骤，"
+            echo "你在磁盘上改的任何东西都会随容器一起消失。所以你唯一的产出是最终回复里的文字。"
+            echo
+            echo "要改代码时：把改动写成 patch 或完整文件片段放进回复，让人自己贴。"
+            echo "要给结论时：直接给结论和依据，不要复述你读了哪些文件。"
+            echo
+            if [ "$IS_PR" = "1" ]; then
+              echo "调度入口：$GITHUB_REPOSITORY 的 PR #$ISSUE（$(jq -r .headRefName .ci/pr.json) → $(jq -r .baseRefName .ci/pr.json)）"
+            else
+              echo "调度入口：$GITHUB_REPOSITORY 的 issue #$ISSUE"
+            fi
+            echo
+            echo "## 讨论上下文（按需自取，不必整段引用）"
+            echo
+            echo "全文在：$GITHUB_WORKSPACE/$THREAD"
+            if [ "$IS_PR" = "1" ] && [ -s .ci/pr.diff ]; then
+              echo "这个 PR 的改动 diff 在：$GITHUB_WORKSPACE/.ci/pr.diff"
+            fi
+            echo
+            echo "## 本次指令（触发这一轮的评论）"
+            echo
+            gh issue view "$ISSUE" --json comments --jq '.comments[-1].body'
+            echo
+            echo "## 本次任务要求"
+            echo "1. 只读：不要写文件、不要 commit、不要 push、不要开 PR。"
+            echo "2. 回复里不要出现密钥、令牌或任何凭据。"
+            echo "3. 直接给结论和下一步，不要复述过程。"
+          } > .ci/task.txt
+          echo "task_bytes=$(wc -c < .ci/task.txt)"
+
+      - name: Start key proxy
+        env:
+          REAL_KEY: ${{ secrets.DSH_API_KEY }}
+        run: |
+          # 真 key 只作为 stdin 喂给代理进程，dsh 全程只看到假值。
+          printf '%s' "$REAL_KEY" | nohup node .xiaojiang/key-proxy.mjs > .ci/proxy.log 2>&1 &
+          PROXY_PID=$!
+          echo "$PROXY_PID" > .ci/proxy.pid
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8787/healthz > .ci/healthz.json 2>/dev/null; then
+              echo "proxy_ready=$(cat .ci/healthz.json)"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::key-proxy 没起来"
+          cat .ci/proxy.log || true
+          exit 1
+
+      - name: Ask
+        env:
+          DSH_API_KEY: sk-local-proxy-not-a-real-key
+        run: |
+          export DEEPSEEK_API_KEY="$DSH_API_KEY"
+          export DSH_API_KEY="$DSH_API_KEY"
+          export DEEPSEEK_BASE_URL="http://127.0.0.1:8787/v1"
+          printf -- '- id: agent-default-model\n  config:\n    provider: deepseek-official\n    model: %s\n' "$DSH_MODEL" > .ci/model.patch.yml
+          set +e
+          # 必须走 stdin 管道：帮助文档说的 "-" 实际会报 a task is required。
+          cat .ci/task.txt | dsh --profile coworker --patch .ci/model.patch.yml --json > .ci/run.jsonl 2> .ci/run.err
+          code=$?
+          set -e
+          echo "$code" > .ci/exit
+          echo "dsh_exit=$code"
+          jq -R -r 'fromjson? | select(.type=="final") | .text' .ci/run.jsonl > .ci/reply.md || true
+          echo "reply_bytes=$(wc -c < .ci/reply.md)"
+          if [ "$code" -ne 0 ]; then
+            echo "::warning::dsh exited $code"
+            tail -c 4000 .ci/run.err
+          fi
+
+      - name: Stop key proxy
+        if: always()
+        run: |
+          echo "proxy_stats=$(curl -fsS http://127.0.0.1:8787/healthz 2>/dev/null || echo '{}')"
+          if [ -f .ci/proxy.pid ]; then
+            kill "$(cat .ci/proxy.pid)" 2>/dev/null || true
+          fi
+          pkill -f 'key-proxy[.]mjs' 2>/dev/null || true
+          echo "proxy_stopped"
+
+      - name: Redact
+        if: always()
+        env:
+          SECRET_A: ${{ secrets.DSH_API_KEY }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const p = '.ci/reply.md';
+          if (!fs.existsSync(p)) { console.log('redact=skip'); process.exit(0); }
+          let s = fs.readFileSync(p, 'utf8');
+          const known = [process.env.SECRET_A].filter(v => typeof v === 'string' && v.length >= 8);
+          let hits = 0;
+          for (const v of known) {
+            const re = new RegExp(v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+            const before = s;
+            s = s.replace(re, '***REDACTED***');
+            if (s !== before) hits++;
+          }
+          const shapes = [
+            /github_pat_[A-Za-z0-9_]{20,}/g,
+            /gh[pousr]_[A-Za-z0-9]{30,}/g,
+            /sk-[A-Za-z0-9_-]{20,}/g,
+            /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+          ];
+          for (const re of shapes) {
+            const before = s;
+            s = s.replace(re, '***REDACTED***');
+            if (s !== before) hits++;
+          }
+          if (hits > 0) s = '> ⚠️ 本条回复里有 ' + hits + ' 处疑似密钥，已经打码。\n\n' + s;
+          fs.writeFileSync(p, s);
+          console.log('redact_hits=' + hits);
+          NODE
+
+      - name: Reply
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          if [ -s .ci/reply.md ] && [ -n "$(tr -d "[:space:]" < .ci/reply.md)" ]; then
+            head -c 60000 .ci/reply.md > .ci/body.md
+          else
+            {
+              echo "任务没有产生回复。dsh 退出码：$(cat .ci/exit 2>/dev/null || echo unknown)"
+              echo
+              echo '```'
+              tail -c 3000 .ci/run.err 2>/dev/null || echo "(stderr 为空)"
+              echo '```'
+            } > .ci/body.md
+          fi
+          # Reply 是另一步 shell，IS_PR 不会带过来 —— 现算一次。
+          if [ "$(jq -r 'if .issue.pull_request then "1" else "0" end' "$GITHUB_EVENT_PATH")" = "1" ]; then
+            gh pr comment "$ISSUE" --body-file .ci/body.md
+          else
+            gh issue comment "$ISSUE" --body-file .ci/body.md
+          fi
