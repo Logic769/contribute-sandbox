@@ -269,7 +269,8 @@ jobs:
           export DSH_API_KEY="$DSH_API_KEY"
           export DEEPSEEK_BASE_URL="http://127.0.0.1:8787/v1"
           printf -- '- id: agent-default-model\n  config:\n    provider: deepseek-official\n    model: %s\n' "$DSH_MODEL" > .ci/model.patch.yml
-          SID_FILE="fork/memory/issues/.session-$ISSUE"
+          SLUG=$(printf '%s' "$GITHUB_REPOSITORY" | tr '/' '-')
+          SID_FILE="memory-repo/memory/$SLUG/issues/.session-$ISSUE"
           ARGS=()
           if [ -f "$SID_FILE" ]; then
             OLD_SID="$(cat "$SID_FILE")"
