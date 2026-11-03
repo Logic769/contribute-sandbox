@@ -84,7 +84,7 @@ jobs:
         run: |
           if ! gh repo view "$MEM_REPO" > /dev/null 2>&1; then
             echo "memory_repo_missing - 正在建 $MEM_REPO"
-            gh repo create "$MEM_REPO" --private --description '小酱的跨对话记忆（交接 + 会话包）' > /dev/null || true
+            gh repo create "$MEM_REPO" --private --description '小酱的跨对话记忆（交接 + 会话包）' 2>&1 | tail -3 || true
             for i in $(seq 1 10); do
               if gh repo view "$MEM_REPO" > /dev/null 2>&1; then break; fi
               sleep 3
@@ -345,8 +345,10 @@ jobs:
       - name: Persist memory
         env:
           ISSUE: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ secrets.XIAOJIANG_PAT }}
         run: |
           cd memory-repo
+          gh auth setup-git
           git add memory || true
           if git diff --cached --quiet; then echo "memory unchanged"; exit 0; fi
           git commit -m "memory: handoff from #$ISSUE"
@@ -413,6 +415,8 @@ jobs:
 
       - name: Save session
         if: always()
+        env:
+          GH_TOKEN: ${{ secrets.XIAOJIANG_PAT }}
         run: |
           SESS="$HOME/.dsh/sessions"
           if [ ! -d "$SESS" ]; then echo "session_save=skip(no sessions dir)"; exit 0; fi
@@ -423,6 +427,7 @@ jobs:
           echo "session_pack_bytes=$SIZE"
           if [ "$SIZE" -gt 52428800 ]; then echo "::warning::会话包 $SIZE 字节超过 50 MB，跳过保存"; exit 0; fi
           cd memory-repo
+          gh auth setup-git
           SLUG=$(printf '%s' "$GITHUB_REPOSITORY" | tr '/' '-')
           BLOB=$(git hash-object -w /tmp/sessions.tar.zst)
           TREE=$(printf '100644 blob %s\tsessions.tar.zst\n' "$BLOB" | git mktree)
