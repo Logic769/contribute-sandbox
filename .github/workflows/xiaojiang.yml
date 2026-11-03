@@ -135,9 +135,12 @@ jobs:
 
       - name: Restore session
         id: sess
+        env:
+          GH_TOKEN: ${{ secrets.XIAOJIANG_PAT }}
         run: |
           mkdir -p "$HOME/.dsh/sessions"
           cd memory-repo
+          gh auth setup-git
           SLUG=$(printf '%s' "$GITHUB_REPOSITORY" | tr '/' '-')
           if git fetch --no-tags --depth 1 origin "session-$SLUG" 2>/dev/null; then
             if git show FETCH_HEAD:sessions.tar.zst > /tmp/sessions.tar.zst 2>/dev/null; then
